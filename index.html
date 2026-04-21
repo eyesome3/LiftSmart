@@ -163,6 +163,169 @@
       };
 
       /* ------------------------------------------------------------------ */
+      /* Anthropic API call                                                   */
+      /* ------------------------------------------------------------------ */
+      const MODEL = 'claude-sonnet-4-6';
+
+      const RECOMMENDATION_TOOL = {
+        name: 'emit_recommendations',
+        description:
+          'Return the recommended next-session prescription for each target exercise, grounded in the athlete\u2019s logged history.',
+        input_schema: {
+          type: 'object',
+          properties: {
+            overall_note: {
+              type: 'string',
+              description:
+                'A 1\u20132 sentence framing note for the whole session (e.g. recovery, cumulative fatigue, goal context). Optional.',
+            },
+            recommendations: {
+              type: 'array',
+              items: {
+                type: 'object',
+                properties: {
+                  exercise: { type: 'string' },
+                  weight: { type: 'number' },
+                  unit: { type: 'string', enum: ['lbs', 'kg'] },
+                  sets: { type: 'integer', minimum: 1 },
+                  reps: { type: 'integer', minimum: 1 },
+                  rationale: {
+                    type: 'string',
+                    description:
+                      '1\u20132 sentences explaining the prescription, grounded in the athlete\u2019s most recent logged set(s) for this exercise. Reference actual numbers.',
+                  },
+                },
+                required: ['exercise', 'weight', 'unit', 'sets', 'reps', 'rationale'],
+              },
+            },
+          },
+          required: ['recommendations'],
+        },
+      };
+
+      const COACH_SYSTEM_PROMPT =
+        'You are an expert strength coach who prescribes progressive overload for resistance training sessions.\n\n' +
+        'Apply these principles:\n' +
+        '- Bulking: aggressive progression. If the athlete hit all prescribed reps last session, add ~2.5\u20135% load on compounds or +1\u20132 reps on isolation. Compound lifts progress slower than isolation.\n' +
+        '- Maintaining: hold volume and intensity steady. Only micro-adjust.\n' +
+        '- Cutting: prioritize maintaining current weights and reps to preserve strength under caloric deficit. Progress only if the prior session was clearly easy.\n' +
+        '- Beginner (<1 yr): linear progression \u2014 add load every session on compounds.\n' +
+        '- Intermediate (1\u20133 yrs): double progression \u2014 hit top of rep range across all sets, then add load.\n' +
+        '- Advanced (3+ yrs): conservative increments, weekly or bi-weekly progress on compounds.\n' +
+        '- If the athlete missed reps on any set last session, repeat the same load rather than progress.\n' +
+        '- Use realistic load increments: compound barbell lifts 2.5\u20135 lb / 1\u20132.5 kg; dumbbell/isolation 5 lb / 2.5 kg or rep-based progression.\n' +
+        '- Keep the weight unit the same as the athlete used most recently for that exercise.\n\n' +
+        'For each target exercise, ground the prescription in the actual numbers from their most recent logged session for that exercise. Never give generic advice like \u201cjust add weight.\u201d Reference real reps and loads. Keep rationales concise (1\u20132 sentences).\n\n' +
+        'Respond only by calling the emit_recommendations tool. Do not return any prose.';
+
+      function formatHeightForPrompt(profile) {
+        if (profile.heightUnit === 'cm')
+          return `${Math.round(profile.heightCm)} cm`;
+        const { ft, in: inch } = cmToFtIn(profile.heightCm);
+        return `${ft}'${inch}\u201d (${Math.round(profile.heightCm)} cm)`;
+      }
+
+      function buildUserPrompt(profile, workouts, targetExercises) {
+        const sorted = [...workouts].sort((a, b) => (a.date < b.date ? -1 : 1));
+        const recent = sorted.slice(-8); // last 8 sessions
+        const lines = [];
+        lines.push('ATHLETE PROFILE');
+        lines.push(`- Body weight: ${profile.bodyWeight} ${profile.bodyWeightUnit}`);
+        lines.push(`- Height: ${formatHeightForPrompt(profile)}`);
+        lines.push(`- Age: ${profile.age}`);
+        lines.push(`- Sex: ${profile.sex}`);
+        lines.push(`- Training experience: ${profile.experience}`);
+        lines.push(`- Current goal: ${profile.goal}`);
+        lines.push('');
+        lines.push('RECENT SESSIONS (oldest \u2192 newest)');
+        if (recent.length === 0) {
+          lines.push('- (none logged yet)');
+        } else {
+          for (const w of recent) {
+            lines.push(`[${w.date}]`);
+            for (const ex of w.exercises) {
+              const reps = ex.sets.map((s) => s.reps).join(', ');
+              lines.push(`  - ${ex.name} @ ${ex.weight} ${ex.unit}: ${reps}`);
+            }
+            if (w.notes) lines.push(`  note: ${w.notes}`);
+          }
+        }
+        lines.push('');
+        lines.push('TARGET EXERCISES FOR NEXT SESSION');
+        for (const name of targetExercises) lines.push(`- ${name}`);
+        lines.push('');
+        lines.push(
+          'Call emit_recommendations with one entry per target exercise. Base each rationale on the athlete\u2019s most recent logged set for that exercise.',
+        );
+        return lines.join('\n');
+      }
+
+      async function getRecommendations({ profile, workouts, targetExercises, apiKey }) {
+        if (!apiKey) throw new Error('Add your Anthropic API key in Settings first.');
+        if (!targetExercises || targetExercises.length === 0)
+          throw new Error('Pick at least one target exercise.');
+
+        const body = {
+          model: MODEL,
+          max_tokens: 2000,
+          system: COACH_SYSTEM_PROMPT,
+          tools: [RECOMMENDATION_TOOL],
+          tool_choice: { type: 'tool', name: 'emit_recommendations' },
+          messages: [
+            { role: 'user', content: buildUserPrompt(profile, workouts, targetExercises) },
+          ],
+        };
+
+        let res;
+        try {
+          res = await fetch('https://api.anthropic.com/v1/messages', {
+            method: 'POST',
+            headers: {
+              'x-api-key': apiKey,
+              'anthropic-version': '2023-06-01',
+              'anthropic-dangerous-direct-browser-access': 'true',
+              'content-type': 'application/json',
+            },
+            body: JSON.stringify(body),
+          });
+        } catch (e) {
+          throw new Error(
+            'Network error reaching Anthropic \u2014 check your connection and try again.',
+          );
+        }
+
+        if (!res.ok) {
+          const text = await res.text();
+          let detail = '';
+          try {
+            const j = JSON.parse(text);
+            detail = j && j.error && j.error.message ? j.error.message : '';
+          } catch (e) {}
+          if (res.status === 401)
+            throw new Error('Invalid API key \u2014 double-check it in Settings.');
+          if (res.status === 403)
+            throw new Error('This key is not permitted to call the Messages API.');
+          if (res.status === 429)
+            throw new Error('Rate limited by Anthropic \u2014 try again in a moment.');
+          if (res.status >= 500)
+            throw new Error('Anthropic is having an issue \u2014 try again shortly.');
+          throw new Error(detail || `API error (${res.status})`);
+        }
+
+        const data = await res.json();
+        const toolBlock =
+          data && Array.isArray(data.content)
+            ? data.content.find((c) => c && c.type === 'tool_use')
+            : null;
+        if (!toolBlock || !toolBlock.input)
+          throw new Error('Model did not return structured output. Try again.');
+        const input = toolBlock.input;
+        if (!Array.isArray(input.recommendations) || input.recommendations.length === 0)
+          throw new Error('No recommendations returned. Try again.');
+        return input;
+      }
+
+      /* ------------------------------------------------------------------ */
       /* Small UI primitives                                                  */
       /* ------------------------------------------------------------------ */
       function cx(...parts) {
@@ -983,9 +1146,291 @@
       }
 
       /* ------------------------------------------------------------------ */
+      /* Coach screen (AI recommendations)                                    */
+      /* ------------------------------------------------------------------ */
+      function Spinner({ className }) {
+        return (
+          <svg
+            className={cx('animate-spin', className)}
+            viewBox="0 0 24 24"
+            fill="none"
+            aria-hidden
+          >
+            <circle cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="3" opacity="0.2" />
+            <path
+              d="M22 12a10 10 0 00-10-10"
+              stroke="currentColor"
+              strokeWidth="3"
+              strokeLinecap="round"
+            />
+          </svg>
+        );
+      }
+
+      function RecommendationCard({ rec }) {
+        return (
+          <Card className="p-4">
+            <div className="mb-2 flex items-start justify-between gap-3">
+              <div>
+                <div className="text-xs font-medium uppercase tracking-wider text-ink-300">
+                  Next session
+                </div>
+                <div className="text-base font-semibold text-ink-100">{rec.exercise}</div>
+              </div>
+              <Badge tone="cyan">AI plan</Badge>
+            </div>
+            <div className="rounded-xl bg-ink-900/70 p-3 ring-1 ring-ink-700">
+              <div className="flex items-baseline gap-1 font-mono">
+                <span className="text-3xl font-bold tracking-tight text-ink-100">
+                  {rec.weight}
+                </span>
+                <span className="text-sm text-ink-300">{rec.unit}</span>
+                <span className="mx-2 text-ink-500">·</span>
+                <span className="text-2xl font-bold text-ink-100">{rec.sets}</span>
+                <span className="text-sm text-ink-300">×</span>
+                <span className="text-2xl font-bold text-ink-100">{rec.reps}</span>
+                <span className="text-xs text-ink-400">reps</span>
+              </div>
+            </div>
+            <p className="mt-3 text-sm leading-relaxed text-ink-200">{rec.rationale}</p>
+          </Card>
+        );
+      }
+
+      function CoachScreen({ profile, workouts, apiKey, onGoSettings, onGoLog }) {
+        const latest = useMemo(() => {
+          if (workouts.length === 0) return null;
+          return [...workouts].sort((a, b) => (a.date < b.date ? 1 : -1))[0];
+        }, [workouts]);
+
+        const [targets, setTargets] = useState(() =>
+          latest
+            ? latest.exercises.map((e) => ({ id: e.id, name: e.name, enabled: true }))
+            : [],
+        );
+        const [customName, setCustomName] = useState('');
+        const [status, setStatus] = useState('idle'); // idle | loading | success | error
+        const [error, setError] = useState('');
+        const [result, setResult] = useState(null);
+
+        const latestKey = latest ? latest.id : null;
+        useEffect(() => {
+          if (latest)
+            setTargets(latest.exercises.map((e) => ({ id: e.id, name: e.name, enabled: true })));
+          else setTargets([]);
+          setResult(null);
+          setStatus('idle');
+        }, [latestKey]);
+
+        if (workouts.length === 0) {
+          return (
+            <div className="mx-auto max-w-xl px-4 pb-24 pt-10">
+              <SectionHeader
+                title="Coach"
+                subtitle="AI recommendations for your next session"
+              />
+              <EmptyState
+                title="Log a session first"
+                message="The coach needs at least one workout of history to ground its prescription."
+                action={<Button onClick={onGoLog}>Log workout</Button>}
+              />
+            </div>
+          );
+        }
+
+        const toggleTarget = (id) =>
+          setTargets((ts) =>
+            ts.map((t) => (t.id === id ? { ...t, enabled: !t.enabled } : t)),
+          );
+        const addCustom = () => {
+          const n = customName.trim();
+          if (!n) return;
+          setTargets((ts) => [
+            ...ts,
+            { id: crypto.randomUUID(), name: n, enabled: true },
+          ]);
+          setCustomName('');
+        };
+        const removeTarget = (id) => setTargets((ts) => ts.filter((t) => t.id !== id));
+
+        const enabledNames = targets.filter((t) => t.enabled).map((t) => t.name);
+
+        const generate = async () => {
+          setError('');
+          setResult(null);
+          if (!apiKey) {
+            setStatus('error');
+            setError('Add your Anthropic API key in Settings first.');
+            return;
+          }
+          if (enabledNames.length === 0) {
+            setStatus('error');
+            setError('Pick at least one target exercise.');
+            return;
+          }
+          setStatus('loading');
+          try {
+            const out = await getRecommendations({
+              profile,
+              workouts,
+              targetExercises: enabledNames,
+              apiKey,
+            });
+            setResult(out);
+            setStatus('success');
+          } catch (e) {
+            setError(e.message || 'Something went wrong.');
+            setStatus('error');
+          }
+        };
+
+        return (
+          <div className="mx-auto max-w-xl px-4 pb-28 pt-6">
+            <SectionHeader
+              title="Coach"
+              subtitle={`Based on your last session (${formatDate(latest.date)})`}
+            />
+
+            {!apiKey && (
+              <Card className="mb-4 border-amber-400/30 bg-amber-500/10 p-4 ring-amber-400/30">
+                <div className="flex items-start gap-3">
+                  <div className="mt-0.5 text-amber-300">
+                    <svg viewBox="0 0 20 20" className="h-5 w-5" fill="currentColor" aria-hidden>
+                      <path d="M10 2a1 1 0 01.894.553l7 14A1 1 0 0117 18H3a1 1 0 01-.894-1.447l7-14A1 1 0 0110 2zm0 5a1 1 0 00-1 1v4a1 1 0 102 0V8a1 1 0 00-1-1zm0 8a1 1 0 100 2 1 1 0 000-2z" />
+                    </svg>
+                  </div>
+                  <div className="flex-1">
+                    <div className="text-sm font-semibold text-amber-200">
+                      No Anthropic API key saved
+                    </div>
+                    <div className="mt-0.5 text-sm text-amber-100/80">
+                      Paste your key in Settings to enable AI recommendations.
+                    </div>
+                    <div className="mt-2">
+                      <Button size="sm" variant="secondary" onClick={onGoSettings}>
+                        Open Settings
+                      </Button>
+                    </div>
+                  </div>
+                </div>
+              </Card>
+            )}
+
+            <Card className="mb-4 p-4">
+              <div className="mb-2 text-xs font-medium uppercase tracking-wider text-ink-300">
+                Plan for these exercises
+              </div>
+              <div className="space-y-2">
+                {targets.map((t) => (
+                  <label
+                    key={t.id}
+                    className={cx(
+                      'flex cursor-pointer items-center gap-3 rounded-xl px-3 py-2 ring-1 transition',
+                      t.enabled
+                        ? 'bg-cyan-500/10 ring-cyan-400/30'
+                        : 'bg-ink-900/60 ring-ink-700',
+                    )}
+                  >
+                    <input
+                      type="checkbox"
+                      checked={t.enabled}
+                      onChange={() => toggleTarget(t.id)}
+                      className="h-4 w-4 shrink-0 accent-cyan-400"
+                    />
+                    <span className="flex-1 text-sm font-medium text-ink-100">{t.name}</span>
+                    <button
+                      type="button"
+                      onClick={() => removeTarget(t.id)}
+                      className="rounded px-2 py-1 text-xs text-ink-400 hover:bg-ink-700 hover:text-red-300"
+                      aria-label={`Remove ${t.name}`}
+                    >
+                      Remove
+                    </button>
+                  </label>
+                ))}
+              </div>
+
+              <div className="mt-3 flex gap-2">
+                <input
+                  list="exercise-presets-coach"
+                  value={customName}
+                  onChange={(e) => setCustomName(e.target.value)}
+                  onKeyDown={(e) => {
+                    if (e.key === 'Enter') {
+                      e.preventDefault();
+                      addCustom();
+                    }
+                  }}
+                  placeholder="Add exercise…"
+                  className="flex-1 rounded-xl bg-ink-900 px-3.5 py-2 text-sm text-ink-100 ring-1 ring-ink-700 placeholder-ink-400 focus:outline-none focus:ring-2 focus:ring-cyan-400/70"
+                />
+                <datalist id="exercise-presets-coach">
+                  {EXERCISE_PRESETS.map((e) => (
+                    <option key={e} value={e} />
+                  ))}
+                </datalist>
+                <Button variant="secondary" size="sm" onClick={addCustom}>
+                  Add
+                </Button>
+              </div>
+            </Card>
+
+            <Button
+              full
+              size="lg"
+              onClick={generate}
+              disabled={status === 'loading' || enabledNames.length === 0}
+              className="mb-5"
+            >
+              {status === 'loading' ? (
+                <>
+                  <Spinner className="h-5 w-5" />
+                  Asking Claude…
+                </>
+              ) : (
+                <>✨ Generate recommendations</>
+              )}
+            </Button>
+
+            {status === 'error' && error && (
+              <Card className="mb-4 border-red-400/30 bg-red-500/10 p-4 ring-red-400/30">
+                <div className="text-sm font-semibold text-red-200">Couldn’t generate a plan</div>
+                <div className="mt-1 text-sm text-red-100/80">{error}</div>
+              </Card>
+            )}
+
+            {status === 'success' && result && (
+              <div className="space-y-3">
+                {result.overall_note && (
+                  <Card className="p-4">
+                    <div className="flex items-start gap-3">
+                      <div className="mt-0.5 flex h-8 w-8 items-center justify-center rounded-lg bg-cyan-500/15 text-cyan-300 ring-1 ring-cyan-400/30">
+                        <svg viewBox="0 0 20 20" className="h-4 w-4" fill="currentColor" aria-hidden>
+                          <path d="M10 2a1 1 0 011 1v1h1a1 1 0 110 2h-1v1a1 1 0 11-2 0V6H8a1 1 0 010-2h1V3a1 1 0 011-1zM5 9a1 1 0 011 1v1h1a1 1 0 110 2H7v1a1 1 0 11-2 0v-1H4a1 1 0 110-2h1v-1a1 1 0 011-1zm10 2a1 1 0 00-1 1v2h-2a1 1 0 100 2h2v2a1 1 0 102 0v-2h2a1 1 0 100-2h-2v-2a1 1 0 00-1-1z" />
+                        </svg>
+                      </div>
+                      <div className="text-sm leading-relaxed text-ink-200">
+                        {result.overall_note}
+                      </div>
+                    </div>
+                  </Card>
+                )}
+                {result.recommendations.map((rec, idx) => (
+                  <RecommendationCard key={`${rec.exercise}-${idx}`} rec={rec} />
+                ))}
+                <div className="pt-1 text-center text-xs text-ink-400">
+                  Tap “Log” after your session to record what you actually did.
+                </div>
+              </div>
+            )}
+          </div>
+        );
+      }
+
+      /* ------------------------------------------------------------------ */
       /* Home screen                                                          */
       /* ------------------------------------------------------------------ */
-      function HomeScreen({ profile, workouts, onGoLog, onGoHistory, onGoSettings }) {
+      function HomeScreen({ profile, workouts, onGoLog, onGoHistory, onGoSettings, onGoCoach }) {
         const recent = useMemo(
           () => [...workouts].sort((a, b) => (a.date < b.date ? 1 : -1)).slice(0, 3),
           [workouts],
@@ -1034,9 +1479,20 @@
               </div>
             </Card>
 
-            <Button full size="lg" onClick={onGoLog} className="mb-5">
-              Log a workout
-            </Button>
+            <div className="mb-5 grid grid-cols-1 gap-2 sm:grid-cols-2">
+              <Button size="lg" onClick={onGoLog} full>
+                Log a workout
+              </Button>
+              <Button
+                size="lg"
+                variant="secondary"
+                onClick={onGoCoach}
+                disabled={workouts.length === 0}
+                full
+              >
+                ✨ Plan next session
+              </Button>
+            </div>
 
             <SectionHeader
               title="Recent workouts"
@@ -1064,22 +1520,34 @@
               </div>
             )}
 
-            <Card className="mt-6 p-4">
-              <div className="flex items-start gap-3">
-                <div className="mt-0.5 flex h-8 w-8 items-center justify-center rounded-lg bg-violet-500/15 text-violet-300 ring-1 ring-violet-400/30">
-                  <svg viewBox="0 0 20 20" className="h-4 w-4" fill="currentColor" aria-hidden>
-                    <path d="M10 2a1 1 0 01.894.553l1.382 2.765 3.053.444a1 1 0 01.554 1.706l-2.21 2.154.522 3.04a1 1 0 01-1.451 1.054L10 12.347l-2.744 1.44a1 1 0 01-1.45-1.054l.52-3.04L4.118 7.54a1 1 0 01.554-1.706l3.053-.444L9.106 2.553A1 1 0 0110 2z" />
+            <button
+              type="button"
+              onClick={onGoCoach}
+              className="mt-6 block w-full text-left"
+            >
+              <Card className="p-4 transition hover:bg-ink-700/40">
+                <div className="flex items-start gap-3">
+                  <div className="mt-0.5 flex h-8 w-8 items-center justify-center rounded-lg bg-violet-500/15 text-violet-300 ring-1 ring-violet-400/30">
+                    <svg viewBox="0 0 20 20" className="h-4 w-4" fill="currentColor" aria-hidden>
+                      <path d="M10 2a1 1 0 01.894.553l1.382 2.765 3.053.444a1 1 0 01.554 1.706l-2.21 2.154.522 3.04a1 1 0 01-1.451 1.054L10 12.347l-2.744 1.44a1 1 0 01-1.45-1.054l.52-3.04L4.118 7.54a1 1 0 01.554-1.706l3.053-.444L9.106 2.553A1 1 0 0110 2z" />
+                    </svg>
+                  </div>
+                  <div className="flex-1">
+                    <div className="font-semibold text-ink-100">
+                      {workouts.length === 0 ? 'AI overload engine' : 'Plan your next session'}
+                    </div>
+                    <div className="text-sm text-ink-300">
+                      {workouts.length === 0
+                        ? 'Log a session, add your Anthropic key in Settings, then the Coach tab will give you a prescription.'
+                        : 'Claude will prescribe loads, sets, and reps based on what you actually hit.'}
+                    </div>
+                  </div>
+                  <svg viewBox="0 0 20 20" className="mt-1 h-4 w-4 text-ink-400" fill="currentColor" aria-hidden>
+                    <path d="M7.5 5l5 5-5 5" stroke="currentColor" strokeWidth="1.5" fill="none" strokeLinecap="round" strokeLinejoin="round" />
                   </svg>
                 </div>
-                <div>
-                  <div className="font-semibold text-ink-100">AI overload coming soon</div>
-                  <div className="text-sm text-ink-300">
-                    Once you log a couple of sessions, add your Anthropic key in settings
-                    and LiftSmart will generate your next workout from your history.
-                  </div>
-                </div>
-              </div>
-            </Card>
+              </Card>
+            </button>
           </div>
         );
       }
@@ -1228,6 +1696,7 @@
         const tabs = [
           { key: 'home', label: 'Home', icon: 'home' },
           { key: 'log', label: 'Log', icon: 'plus' },
+          { key: 'coach', label: 'Coach', icon: 'sparkles' },
           { key: 'history', label: 'History', icon: 'list' },
           { key: 'settings', label: 'Settings', icon: 'gear' },
         ];
@@ -1274,6 +1743,13 @@
           return (
             <svg viewBox="0 0 24 24" className={common} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" aria-hidden>
               <path d="M4 6h16M4 12h16M4 18h10" />
+            </svg>
+          );
+        if (name === 'sparkles')
+          return (
+            <svg viewBox="0 0 24 24" className={common} fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden>
+              <path d="M12 3l1.5 4.5L18 9l-4.5 1.5L12 15l-1.5-4.5L6 9l4.5-1.5L12 3z" />
+              <path d="M18 15l.8 2.2L21 18l-2.2.8L18 21l-.8-2.2L15 18l2.2-.8L18 15z" />
             </svg>
           );
         return (
@@ -1362,6 +1838,16 @@
                 onGoLog={() => setTab('log')}
                 onGoHistory={() => setTab('history')}
                 onGoSettings={() => setTab('settings')}
+                onGoCoach={() => setTab('coach')}
+              />
+            )}
+            {tab === 'coach' && (
+              <CoachScreen
+                profile={profile}
+                workouts={workouts}
+                apiKey={apiKey}
+                onGoSettings={() => setTab('settings')}
+                onGoLog={() => setTab('log')}
               />
             )}
             {tab === 'history' && (
